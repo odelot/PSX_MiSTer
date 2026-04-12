@@ -1,4 +1,112 @@
-# [Playstation](https://en.wikipedia.org/wiki/PlayStation_(console)) for [MiSTer Platform](https://github.com/MiSTer-devel/Main_MiSTer/wiki)
+# PSX_MiSTer — RetroAchievements Fork
+
+This is a fork of the official [PSX core for MiSTer](https://github.com/MiSTer-devel/PSX_MiSTer) with modifications to support **RetroAchievements** on MiSTer FPGA.
+
+> **Status:** Experimental / Proof of Concept — works together with the [modified Main_MiSTer binary](https://github.com/odelot/Main_MiSTer).
+
+## What's Different from the Original
+
+The upstream PSX core is an FPGA PlayStation implementation. This fork adds two new modules and minor wiring changes so the ARM side (Main_MiSTer) can read emulated PSX RAM for achievement evaluation. **No emulation logic was changed** — the core plays games identically to the original.
+
+### Added Files
+
+| File | Purpose |
+|------|--------|
+| `rtl/ra_ram_mirror_psx.sv` | Reads requested PSX Main RAM addresses and writes cached values to DDRAM for the ARM CPU |
+| `rtl/ddram_arb_psx.sv` | DDRAM arbiter that gives the PSX core priority while allowing the RA module to use idle cycles |
+
+### Modified Files
+
+| File | Change |
+|------|--------|
+| `PSX.sv` | Instantiates both new modules, wires SDRAM CH4 for RA reads, adds DDRAM read/write channels |
+| `files.qip` | Adds both new `.sv` files to the Quartus project |
+
+### How the RAM Mirror Works
+
+The PSX has 2 MB of main RAM — too large to copy wholesale every frame. Like the SNES implementation, the PSX core uses a **selective address protocol (Option C)**:
+
+1. The **ARM binary** writes a list of RAM addresses it needs to evaluate to DDRAM offset `0x40000` (up to 4096 addresses per frame).
+2. On each **VBlank**, the FPGA module reads those addresses one by one from PSX Main RAM via a dedicated SDRAM channel (CH4), accumulating the byte values.
+3. The values are written in 8-byte chunks to DDRAM offset `0x48000`, and a response counter is updated so the ARM knows the data is ready.
+4. The ARM binary reads the values and feeds them to the rcheevos achievement engine for evaluation.
+
+The `ddram_arb_psx.sv` arbiter ensures the PSX core always has priority on the DDRAM bus — the RA module only accesses DDRAM during idle cycles, so there is no impact on emulation timing.
+
+**Memory region exposed:**
+
+| Region | PSX Address | Size | Description |
+|--------|------------|------|-------------|
+| Main RAM | $000000–$1FFFFF | 2 MB | All game variables, stack, heap — byte-addressed linearly |
+
+### DDRAM Layout
+
+```
+0x00000   Header:   magic ("RACH") + flags + frame counter
+0x40000   AddrReq:  ARM → FPGA address request list (count + request_id + addresses)
+0x48000   ValResp:  FPGA → ARM value response cache (response_id + response_frame + values)
+```
+
+All data flows through shared DDRAM at ARM physical address **0x3D000000**.
+
+### Architecture Diagram
+
+```
+┌───────────────────────────────────────┐
+│          PSX FPGA Core                │
+│                                       │
+│  Main RAM (2MB) in SDRAM              │
+│  accessed via CH4                     │
+└─────────────┬─────────────────────────┘
+              │  VBlank
+              ▼
+┌───────────────────────────────────────┐
+│     ra_ram_mirror_psx.sv              │
+│  Reads requested addrs from SDRAM CH4 │
+│  Writes header + values to DDRAM      │
+│                                       │
+│     ddram_arb_psx.sv                  │
+│  Arbitrates DDRAM: PSX core first,    │
+│  RA module on idle cycles             │
+└─────────────┬─────────────────────────┘
+              │  DDRAM @ 0x3D000000
+              ▼
+┌───────────────────────────────────────┐
+│     Main_MiSTer (ARM binary)          │
+│  mmap /dev/mem → reads mirror         │
+│  Writes address list → reads values   │
+│  rcheevos hashes disc + evaluates     │
+└───────────────────────────────────────┘
+```
+
+### CD / Disc Hashing
+
+Unlike cartridge-based systems, PSX games are disc images. The Main_MiSTer binary uses the `rc_hash_generate_from_file()` function from the rcheevos library, which handles `.cue+.bin`, `.chd`, and `.iso` formats transparently — no manual header-skipping needed.
+
+## How to Try It
+
+1. Download the latest PSX core binary (`PSX_*.rbf`) from the [Releases](https://github.com/odelot/PSX_MiSTer/releases) page.
+2. Copy the `.rbf` file to `/media/fat/_Console/` on your MiSTer SD card (replacing or alongside the stock PSX core).
+3. You will also need the **modified Main_MiSTer binary** from [odelot/Main_MiSTer](https://github.com/odelot/Main_MiSTer) — follow the setup instructions there to configure your RetroAchievements credentials.
+4. Reboot your MiSTer, load the PSX core, and open a game that has achievements on [retroachievements.org](https://retroachievements.org/).
+
+## Building from Source
+
+Open the project in Quartus Prime (use the same version as the upstream MiSTer PSX core) and compile. Both `ra_ram_mirror_psx.sv` and `ddram_arb_psx.sv` are already included in `files.qip`.
+
+## Links
+
+- Original PSX core: [MiSTer-devel/PSX_MiSTer](https://github.com/MiSTer-devel/PSX_MiSTer)
+- Modified Main binary (required): [odelot/Main_MiSTer](https://github.com/odelot/Main_MiSTer)
+- RetroAchievements: [retroachievements.org](https://retroachievements.org/)
+
+---
+
+# Original PSX Core Documentation
+
+*Everything below is from the upstream [PSX_MiSTer](https://github.com/MiSTer-devel/PSX_MiSTer) README and applies unchanged to this fork.*
+
+## [Playstation](https://en.wikipedia.org/wiki/PlayStation_(console)) for [MiSTer Platform](https://github.com/MiSTer-devel/Main_MiSTer/wiki)
 
 ## Hardware Requirements
 SDRAM of any size is required.

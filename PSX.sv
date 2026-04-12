@@ -1132,16 +1132,16 @@ psx
    .dma_wr(dma_wr),
    .dma_reqprocessed(dma_reqprocessed),
    .dma_data(dma_data),
-   // vram/ddr3
-   .DDRAM_BUSY      (DDRAM_BUSY      ),
-   .DDRAM_BURSTCNT  (DDRAM_BURSTCNT  ),
-   .DDRAM_ADDR      (DDRAM_ADDR      ),
-   .DDRAM_DOUT      (DDRAM_DOUT      ),
-   .DDRAM_DOUT_READY(DDRAM_DOUT_READY),
-   .DDRAM_RD        (DDRAM_RD        ),
-   .DDRAM_DIN       (DDRAM_DIN       ),
-   .DDRAM_BE        (DDRAM_BE        ),
-   .DDRAM_WE        (DDRAM_WE        ),
+   // vram/ddr3 (routed through DDRAM arbiter)
+   .DDRAM_BUSY      (psx_ddram_busy      ),
+   .DDRAM_BURSTCNT  (psx_ddram_burstcnt  ),
+   .DDRAM_ADDR      (psx_ddram_addr      ),
+   .DDRAM_DOUT      (psx_ddram_dout      ),
+   .DDRAM_DOUT_READY(psx_ddram_dout_ready),
+   .DDRAM_RD        (psx_ddram_rd        ),
+   .DDRAM_DIN       (psx_ddram_din       ),
+   .DDRAM_BE        (psx_ddram_be        ),
+   .DDRAM_WE        (psx_ddram_we        ),
    // cd
    .region          (region),
    .region_out      (region_out),
@@ -1425,6 +1425,11 @@ sdram sdram
 	.ch3_be   ((exe_download | bios_download) ? 4'b1111            : cheats_be),
 	.ch3_ready(sdramCh3_done),
 
+	.ch4_addr (ra_ch4_addr),
+	.ch4_dout (ra_ch4_dout),
+	.ch4_req  (ra_ch4_req),
+	.ch4_ready(ra_ch4_ready),
+
 	.dmafifo_adr  (sdram_dmafifo_adr),
 	.dmafifo_data (sdram_dmafifo_data),
 	.dmafifo_empty(sdram_dmafifo_empty),
@@ -1509,6 +1514,104 @@ assign sdram_writeack2 = '0;
 
 
 assign DDRAM_CLK = clk_2x;
+
+////////////////////////////  RETROACHIEVEMENTS  ////////////////////////
+
+// Intermediate DDRAM signals for PSX core (psx_mister)
+wire        psx_ddram_busy;
+wire  [7:0] psx_ddram_burstcnt;
+wire [28:0] psx_ddram_addr;
+wire [63:0] psx_ddram_dout;
+wire        psx_ddram_dout_ready;
+wire        psx_ddram_rd;
+wire [63:0] psx_ddram_din;
+wire  [7:0] psx_ddram_be;
+wire        psx_ddram_we;
+
+// RA DDRAM signals
+wire [28:0] ra_ddram_wr_addr;
+wire [63:0] ra_ddram_wr_din;
+wire  [7:0] ra_ddram_wr_be;
+wire        ra_ddram_wr_req;
+wire        ra_ddram_wr_ack;
+wire [28:0] ra_ddram_rd_addr;
+wire        ra_ddram_rd_req;
+wire        ra_ddram_rd_ack;
+wire [63:0] ra_ddram_rd_dout;
+
+// RA SDRAM CH4 signals
+wire [26:0] ra_ch4_addr;
+wire [31:0] ra_ch4_dout;
+wire        ra_ch4_req;
+wire        ra_ch4_ready;
+
+// RA status
+wire        ra_active;
+wire [31:0] ra_dbg_frame;
+
+// DDRAM arbiter: PSX core + RA → physical DDRAM
+ddram_arb_psx ddram_arb
+(
+	.clk            (clk_2x),
+
+	.PHY_BUSY       (DDRAM_BUSY),
+	.PHY_BURSTCNT   (DDRAM_BURSTCNT),
+	.PHY_ADDR       (DDRAM_ADDR),
+	.PHY_DOUT       (DDRAM_DOUT),
+	.PHY_DOUT_READY (DDRAM_DOUT_READY),
+	.PHY_RD         (DDRAM_RD),
+	.PHY_DIN        (DDRAM_DIN),
+	.PHY_BE         (DDRAM_BE),
+	.PHY_WE         (DDRAM_WE),
+
+	.PSX_BUSY       (psx_ddram_busy),
+	.PSX_BURSTCNT   (psx_ddram_burstcnt),
+	.PSX_ADDR       (psx_ddram_addr),
+	.PSX_DOUT       (psx_ddram_dout),
+	.PSX_DOUT_READY (psx_ddram_dout_ready),
+	.PSX_RD         (psx_ddram_rd),
+	.PSX_DIN        (psx_ddram_din),
+	.PSX_BE         (psx_ddram_be),
+	.PSX_WE         (psx_ddram_we),
+
+	.ra_wr_addr     (ra_ddram_wr_addr),
+	.ra_wr_din      (ra_ddram_wr_din),
+	.ra_wr_be       (ra_ddram_wr_be),
+	.ra_wr_req      (ra_ddram_wr_req),
+	.ra_wr_ack      (ra_ddram_wr_ack),
+
+	.ra_rd_addr     (ra_ddram_rd_addr),
+	.ra_rd_req      (ra_ddram_rd_req),
+	.ra_rd_ack      (ra_ddram_rd_ack),
+	.ra_rd_dout     (ra_ddram_rd_dout)
+);
+
+// RetroAchievements RAM mirror (reads Main RAM via SDRAM CH4)
+ra_ram_mirror_psx ra_mirror
+(
+	.clk             (clk_1x),
+	.reset           (reset),
+	.vblank          (vbl),
+
+	.ch4_addr        (ra_ch4_addr),
+	.ch4_req         (ra_ch4_req),
+	.ch4_dout        (ra_ch4_dout),
+	.ch4_ready       (ra_ch4_ready),
+
+	.ddram_wr_addr   (ra_ddram_wr_addr),
+	.ddram_wr_din    (ra_ddram_wr_din),
+	.ddram_wr_be     (ra_ddram_wr_be),
+	.ddram_wr_req    (ra_ddram_wr_req),
+	.ddram_wr_ack    (ra_ddram_wr_ack),
+
+	.ddram_rd_addr   (ra_ddram_rd_addr),
+	.ddram_rd_req    (ra_ddram_rd_req),
+	.ddram_rd_ack    (ra_ddram_rd_ack),
+	.ddram_rd_dout   (ra_ddram_rd_dout),
+
+	.active          (ra_active),
+	.dbg_frame_counter(ra_dbg_frame)
+);
 
 ////////////////////////////  VIDEO  ////////////////////////////////////
 
