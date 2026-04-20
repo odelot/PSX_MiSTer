@@ -20,35 +20,35 @@
 //   [0x48008] Values:   val[0..7](8b each), val[8..15], ...   (8 per 64-bit word)
 
 module ra_ram_mirror_psx #(
-	parameter [28:0] DDRAM_BASE = 29'h07A00000,  // ARM phys 0x3D000000 >> 3
-	parameter BYPASS_SDRAM = 0   // Debug: skip SDRAM reads, write addr-based pattern
+parameter [28:0] DDRAM_BASE = 29'h07A00000,  // ARM phys 0x3D000000 >> 3
+parameter BYPASS_SDRAM = 0   // Debug: skip SDRAM reads, write addr-based pattern
 )(
-	input             clk,           // clk_1x (~33 MHz)
-	input             reset,
-	input             vblank,
+input             clk,           // clk_1x (~33 MHz)
+input             reset,
+input             vblank,
 
-	// SDRAM CH4 read interface (Main RAM)
-	output reg [26:0] ch4_addr,
-	output reg        ch4_req,
-	input      [31:0] ch4_dout,
-	input             ch4_ready,
+// SDRAM CH4 read interface (Main RAM)
+output reg [26:0] ch4_addr,
+output reg        ch4_req,
+input      [31:0] ch4_dout,
+input             ch4_ready,
 
-	// DDRAM write interface (toggle req/ack)
-	output reg [28:0] ddram_wr_addr,
-	output reg [63:0] ddram_wr_din,
-	output reg  [7:0] ddram_wr_be,
-	output reg        ddram_wr_req,
-	input             ddram_wr_ack,
+// DDRAM write interface (toggle req/ack)
+output reg [28:0] ddram_wr_addr,
+output reg [63:0] ddram_wr_din,
+output reg  [7:0] ddram_wr_be,
+output reg        ddram_wr_req,
+input             ddram_wr_ack,
 
-	// DDRAM read interface (toggle req/ack)
-	output reg [28:0] ddram_rd_addr,
-	output reg        ddram_rd_req,
-	input             ddram_rd_ack,
-	input      [63:0] ddram_rd_dout,
+// DDRAM read interface (toggle req/ack)
+output reg [28:0] ddram_rd_addr,
+output reg        ddram_rd_req,
+input             ddram_rd_ack,
+input      [63:0] ddram_rd_dout,
 
-	// Status
-	output reg        active,
-	output reg [31:0] dbg_frame_counter
+// Status
+output reg        active,
+output reg [31:0] dbg_frame_counter
 );
 
 // ======================================================================
@@ -58,8 +58,14 @@ localparam [28:0] ADDRLIST_BASE = DDRAM_BASE + 29'h8000;  // byte offset 0x40000
 localparam [28:0] VALCACHE_BASE = DDRAM_BASE + 29'h9000;  // byte offset 0x48000 / 8
 localparam [12:0] MAX_ADDRS     = 13'd4096;
 
+// Realtime query mailbox (Option C "on steroids")
+localparam [28:0] QUERY_CTRL_ADDR = DDRAM_BASE + 29'hA000;  // byte offset 0x50000 / 8
+localparam [28:0] QUERY_REQ_BASE  = DDRAM_BASE + 29'hA001;  // byte offset 0x50008 / 8
+localparam [28:0] QUERY_RESP_BASE = DDRAM_BASE + 29'hA011;  // byte offset 0x50088 / 8
+localparam [3:0]  MAX_RT_QUERIES  = 4'd16;
+
 // FPGA version stamp (ARM checks this to verify bitstream)
-localparam [7:0] FPGA_VERSION   = 8'h01;  // PSX v1
+localparam [7:0] FPGA_VERSION   = 8'h02;  // PSX v2 (realtime queries)
 
 // ======================================================================
 // Clock domain crossing synchronizers (DDRAM arbiter is on clk_2x)
@@ -67,12 +73,9 @@ localparam [7:0] FPGA_VERSION   = 8'h01;  // PSX v1
 reg dwr_ack_s1, dwr_ack_s2;
 reg drd_ack_s1, drd_ack_s2;
 always @(posedge clk) begin
-	dwr_ack_s1 <= ddram_wr_ack; dwr_ack_s2 <= dwr_ack_s1;
-	drd_ack_s1 <= ddram_rd_ack; drd_ack_s2 <= drd_ack_s1;
+dwr_ack_s1 <= ddram_wr_ack; dwr_ack_s2 <= dwr_ack_s1;
+drd_ack_s1 <= ddram_rd_ack; drd_ack_s2 <= drd_ack_s1;
 end
-
-// NOTE: ch4_ready is already in clk_1x domain (sdram.sv clk_base output).
-// No synchronizer needed — use directly.
 
 // ======================================================================
 // VBlank edge detection
@@ -80,6 +83,17 @@ end
 reg vblank_prev;
 wire vblank_rising = vblank & ~vblank_prev;
 always @(posedge clk) vblank_prev <= vblank;
+
+// Sticky vblank flag — captures edge even when busy in query states
+reg vblank_pending;
+always @(posedge clk) begin
+if (reset)
+vblank_pending <= 1'b0;
+else if (vblank_rising)
+vblank_pending <= 1'b1;
+else if (state == S_IDLE && vblank_pending)
+vblank_pending <= 1'b0;
+end
 
 // ======================================================================
 // State machine
@@ -92,8 +106,8 @@ localparam S_PARSE_HDR   = 5'd4;
 localparam S_READ_PAIR   = 5'd5;
 localparam S_PARSE_ADDR  = 5'd6;
 localparam S_DISPATCH    = 5'd7;
-localparam S_FETCH_RAM   = 5'd8;   // Issue SDRAM CH4 read
-localparam S_RAM_WAIT    = 5'd9;   // Wait for CH4 ready
+localparam S_FETCH_RAM   = 5'd8;
+localparam S_RAM_WAIT    = 5'd9;
 localparam S_STORE_VAL   = 5'd10;
 localparam S_FLUSH_BUF   = 5'd11;
 localparam S_WRITE_RESP  = 5'd12;
@@ -101,6 +115,13 @@ localparam S_WR_HDR0     = 5'd13;
 localparam S_WR_HDR1     = 5'd14;
 localparam S_WR_DBG      = 5'd15;
 localparam S_WR_DBG2     = 5'd16;
+// Realtime query states
+localparam S_QRY_PARSE   = 5'd17;
+localparam S_QRY_RD_REQ  = 5'd18;
+localparam S_QRY_FETCH   = 5'd19;
+localparam S_QRY_WAIT    = 5'd20;
+localparam S_QRY_WR_RESP = 5'd21;
+localparam S_QRY_WR_CTRL = 5'd22;
 
 reg [4:0]  state;
 reg [4:0]  return_state;
@@ -118,10 +139,21 @@ reg [63:0] collect_buf;
 reg  [3:0] collect_cnt;
 reg [12:0] val_word_idx;
 
-reg        ch4_phase;        // 0=request sent, 1=polling ready
+reg        ch4_phase;
 reg [15:0] timeout;
 reg  [7:0] fetch_byte;
-reg        ch4_req_pending;  // Tracks that we have an outstanding CH4 request
+reg        ch4_req_pending;
+
+// Realtime query registers
+reg  [7:0] qry_request_seq;
+reg  [7:0] qry_last_seen_seq;
+reg  [7:0] qry_num;
+reg  [3:0] qry_idx;
+reg [31:0] qry_addr;
+reg  [7:0] qry_num_bytes;
+reg [31:0] qry_value;
+reg  [2:0] qry_byte_idx;
+reg        qry_ch4_phase;
 
 // Debug counters
 reg [15:0] dbg_ok_cnt;
@@ -132,266 +164,378 @@ reg [15:0] dbg_max_timeout;
 reg  [7:0] dbg_dispatch_cnt;
 reg [15:0] dbg_first_addr;
 
+// DDRAM wait timeout counter (prevents permanent stall if arbiter doesn't respond)
+reg [19:0] ddram_wait_timeout;
+
 // ======================================================================
 // Main state machine
 // ======================================================================
 always @(posedge clk) begin
-	if (reset) begin
-		state          <= S_IDLE;
-		active         <= 1'b0;
-		frame_counter  <= 32'd0;
-		ch4_req        <= 1'b0;
-		ch4_req_pending <= 1'b0;
-		ddram_wr_req   <= dwr_ack_s2;
-		ddram_rd_req   <= drd_ack_s2;
-	end
-	else begin
-		// Deassert ch4_req after one cycle (pulse)
-		if (ch4_req) ch4_req <= 1'b0;
+if (reset) begin
+state           <= S_IDLE;
+active          <= 1'b0;
+frame_counter   <= 32'd0;
+ch4_req         <= 1'b0;
+ch4_req_pending <= 1'b0;
+ddram_wr_req    <= dwr_ack_s2;
+ddram_rd_req    <= drd_ack_s2;
+qry_last_seen_seq <= 8'd0;
+end
+else begin
+// Deassert ch4_req after one cycle (pulse)
+if (ch4_req) ch4_req <= 1'b0;
 
-		case (state)
+case (state)
 
-		// =============================================================
-		// IDLE: Wait for VBlank rising edge
-		// =============================================================
-		S_IDLE: begin
-			active <= 1'b0;
-			if (vblank_rising) begin
-				active <= 1'b1;
-				dbg_ok_cnt       <= 16'd0;
-				dbg_timeout_cnt  <= 16'd0;
-				dbg_first_cap    <= 1'b0;
-				dbg_first_dout   <= 16'd0;
-				dbg_max_timeout  <= 16'd0;
-				dbg_dispatch_cnt <= 8'd0;
-				dbg_first_addr   <= 16'd0;
-				// Write header with busy=1
-				ddram_wr_addr <= DDRAM_BASE;
-				ddram_wr_din  <= {16'd0, 8'h01, 8'd0, 32'h52414348};
-				ddram_wr_be   <= 8'hFF;
-				ddram_wr_req  <= ~ddram_wr_req;
-				return_state  <= S_READ_HDR;
-				state         <= S_DD_WR_WAIT;
-			end
-		end
+// =============================================================
+// IDLE: Wait for VBlank (sticky flag) or poll query mailbox
+// =============================================================
+S_IDLE: begin
+active <= 1'b0;
+if (vblank_pending) begin
+active <= 1'b1;
+dbg_ok_cnt       <= 16'd0;
+dbg_timeout_cnt  <= 16'd0;
+dbg_first_cap    <= 1'b0;
+dbg_first_dout   <= 16'd0;
+dbg_max_timeout  <= 16'd0;
+dbg_dispatch_cnt <= 8'd0;
+dbg_first_addr   <= 16'd0;
+// Write header with busy=1
+ddram_wr_addr <= DDRAM_BASE;
+ddram_wr_din  <= {16'd0, 8'h01, 8'd0, 32'h52414348};
+ddram_wr_be   <= 8'hFF;
+ddram_wr_req  <= ~ddram_wr_req;
+return_state  <= S_READ_HDR;
+state         <= S_DD_WR_WAIT;
+end
+else begin
+// Poll realtime query mailbox when not in VBlank
+ddram_rd_addr <= QUERY_CTRL_ADDR;
+ddram_rd_req  <= ~ddram_rd_req;
+return_state  <= S_QRY_PARSE;
+state         <= S_DD_RD_WAIT;
+end
+end
 
-		// =============================================================
-		S_DD_WR_WAIT: begin
-			if (ddram_wr_req == dwr_ack_s2)
-				state <= return_state;
-		end
+// =============================================================
+S_DD_WR_WAIT: begin
+ddram_wait_timeout <= ddram_wait_timeout + 20'd1;
+if (ddram_wr_req == dwr_ack_s2) begin
+ddram_wait_timeout <= 20'd0;
+state <= return_state;
+end else if (ddram_wait_timeout >= 20'hFFFFF) begin
+// Timeout (~32ms at 33MHz) - abort this VBlank cycle to avoid permanent stall
+ddram_wait_timeout <= 20'd0;
+state <= S_IDLE;
+end
+end
 
-		S_DD_RD_WAIT: begin
-			if (ddram_rd_req == drd_ack_s2) begin
-				rd_data <= ddram_rd_dout;
-				state   <= return_state;
-			end
-		end
+S_DD_RD_WAIT: begin
+ddram_wait_timeout <= ddram_wait_timeout + 20'd1;
+if (ddram_rd_req == drd_ack_s2) begin
+ddram_wait_timeout <= 20'd0;
+rd_data <= ddram_rd_dout;
+state   <= return_state;
+end else if (ddram_wait_timeout >= 20'hFFFFF) begin
+// Timeout - abort this VBlank cycle
+ddram_wait_timeout <= 20'd0;
+state <= S_IDLE;
+end
+end
 
-		// =============================================================
-		S_READ_HDR: begin
-			ddram_rd_addr <= ADDRLIST_BASE;
-			ddram_rd_req  <= ~ddram_rd_req;
-			return_state  <= S_PARSE_HDR;
-			state         <= S_DD_RD_WAIT;
-		end
+// =============================================================
+S_READ_HDR: begin
+ddram_rd_addr <= ADDRLIST_BASE;
+ddram_rd_req  <= ~ddram_rd_req;
+return_state  <= S_PARSE_HDR;
+state         <= S_DD_RD_WAIT;
+end
 
-		S_PARSE_HDR: begin
-			req_id <= rd_data[63:32];
-			if (rd_data[31:0] == 32'd0) begin
-				req_count <= 32'd0;
-				state     <= S_WRITE_RESP;
-			end else begin
-				req_count    <= (rd_data[31:0] > {19'd0, MAX_ADDRS}) ?
-				                {19'd0, MAX_ADDRS} : rd_data[31:0];
-				addr_idx     <= 13'd0;
-				collect_cnt  <= 4'd0;
-				collect_buf  <= 64'd0;
-				val_word_idx <= 13'd0;
-				state        <= S_READ_PAIR;
-			end
-		end
+S_PARSE_HDR: begin
+req_id <= rd_data[63:32];
+if (rd_data[31:0] == 32'd0) begin
+req_count <= 32'd0;
+state     <= S_WRITE_RESP;
+end else begin
+req_count    <= (rd_data[31:0] > {19'd0, MAX_ADDRS}) ?
+                {19'd0, MAX_ADDRS} : rd_data[31:0];
+addr_idx     <= 13'd0;
+collect_cnt  <= 4'd0;
+collect_buf  <= 64'd0;
+val_word_idx <= 13'd0;
+state        <= S_READ_PAIR;
+end
+end
 
-		// =============================================================
-		S_READ_PAIR: begin
-			ddram_rd_addr <= ADDRLIST_BASE + 29'd1 + {16'd0, addr_idx[12:1]};
-			ddram_rd_req  <= ~ddram_rd_req;
-			return_state  <= S_PARSE_ADDR;
-			state         <= S_DD_RD_WAIT;
-		end
+// =============================================================
+S_READ_PAIR: begin
+ddram_rd_addr <= ADDRLIST_BASE + 29'd1 + {16'd0, addr_idx[12:1]};
+ddram_rd_req  <= ~ddram_rd_req;
+return_state  <= S_PARSE_ADDR;
+state         <= S_DD_RD_WAIT;
+end
 
-		S_PARSE_ADDR: begin
-			if (!addr_idx[0]) begin
-				addr_word <= rd_data;
-				cur_addr  <= rd_data[31:0];
-			end else begin
-				cur_addr <= addr_word[63:32];
-			end
-			state <= S_DISPATCH;
-		end
+S_PARSE_ADDR: begin
+if (!addr_idx[0]) begin
+addr_word <= rd_data;
+cur_addr  <= rd_data[31:0];
+end else begin
+cur_addr <= addr_word[63:32];
+end
+state <= S_DISPATCH;
+end
 
-		// =============================================================
-		// Route to SDRAM read (all addresses are Main RAM)
-		// =============================================================
-		S_DISPATCH: begin
-			dbg_dispatch_cnt <= dbg_dispatch_cnt + 8'd1;
-			if (!dbg_dispatch_cnt)
-				dbg_first_addr <= cur_addr[15:0];
-			if (BYPASS_SDRAM) begin
-				fetch_byte <= cur_addr[7:0] ^ 8'hA5;
-				state      <= S_STORE_VAL;
-			end
-			else begin
-				state <= S_FETCH_RAM;
-			end
-		end
+// =============================================================
+S_DISPATCH: begin
+dbg_dispatch_cnt <= dbg_dispatch_cnt + 8'd1;
+if (!dbg_dispatch_cnt)
+dbg_first_addr <= cur_addr[15:0];
+if (BYPASS_SDRAM) begin
+fetch_byte <= cur_addr[7:0] ^ 8'hA5;
+state      <= S_STORE_VAL;
+end
+else begin
+state <= S_FETCH_RAM;
+end
+end
 
-		// =============================================================
-		// SDRAM CH4 read: byte from Main RAM
-		// VBlank gate: only start reads while vblank is HIGH
-		// =============================================================
-		S_FETCH_RAM: begin
-			if (vblank) begin
-				// CH4 address: chip=0, byte address of Main RAM
-				// ch4_addr[25:1] = word address, ch4_addr[26] = chip
-				ch4_addr      <= {6'b0, cur_addr[20:0]};
-				ch4_req       <= 1'b1;  // one-cycle pulse
-				ch4_req_pending <= 1'b1;
-				ch4_phase     <= 1'b0;
-				timeout       <= 16'd0;
-				state         <= S_RAM_WAIT;
-			end
-			// else: stay until vblank goes HIGH
-		end
+// =============================================================
+// SDRAM CH4 read: byte from Main RAM
+// =============================================================
+S_FETCH_RAM: begin
+// Removed vblank guard - CH4 interface handles SDRAM arbitration.
+// The previous 'if (vblank)' caused permanent stalls when VBlank
+// stopped pulsing (e.g., during PSX video mode changes).
+ch4_addr        <= {6'b0, cur_addr[20:0]};
+ch4_req         <= 1'b1;
+ch4_req_pending <= 1'b1;
+ch4_phase       <= 1'b0;
+timeout         <= 16'd0;
+state           <= S_RAM_WAIT;
+end
 
-		S_RAM_WAIT: begin
-			timeout <= timeout + 16'd1;
-			if (!ch4_phase) begin
-				// Skip first cycle (request just sent, ready might be stale)
-				ch4_phase <= 1'b1;
-			end else begin
-				if (ch4_ready) begin
-					// CH4 returns 32 bits (two 16-bit words)
-					// Select byte using cur_addr[0]
-					fetch_byte <= cur_addr[0] ? ch4_dout[15:8] : ch4_dout[7:0];
-					ch4_req_pending <= 1'b0;
-					dbg_ok_cnt <= dbg_ok_cnt + 16'd1;
-					if (!dbg_first_cap) begin
-						dbg_first_dout <= ch4_dout[15:0];
-						dbg_first_cap  <= 1'b1;
-					end
-					if (timeout > dbg_max_timeout)
-						dbg_max_timeout <= timeout;
-					state <= S_STORE_VAL;
-				end
-			end
-			// Timeout safety (~1ms at 33MHz)
-			if (timeout >= 16'hFFFF) begin
-				fetch_byte <= 8'd0;
-				ch4_req_pending <= 1'b0;
-				dbg_timeout_cnt <= dbg_timeout_cnt + 16'd1;
-				state <= S_STORE_VAL;
-			end
-		end
+S_RAM_WAIT: begin
+timeout <= timeout + 16'd1;
+if (!ch4_phase) begin
+ch4_phase <= 1'b1;
+end else begin
+if (ch4_ready) begin
+fetch_byte <= cur_addr[0] ? ch4_dout[15:8] : ch4_dout[7:0];
+ch4_req_pending <= 1'b0;
+dbg_ok_cnt <= dbg_ok_cnt + 16'd1;
+if (!dbg_first_cap) begin
+dbg_first_dout <= ch4_dout[15:0];
+dbg_first_cap  <= 1'b1;
+end
+if (timeout > dbg_max_timeout)
+dbg_max_timeout <= timeout;
+state <= S_STORE_VAL;
+end
+end
+if (timeout >= 16'hFFFF) begin
+fetch_byte <= 8'd0;
+ch4_req_pending <= 1'b0;
+dbg_timeout_cnt <= dbg_timeout_cnt + 16'd1;
+state <= S_STORE_VAL;
+end
+end
 
-		// =============================================================
-		S_STORE_VAL: begin
-			case (collect_cnt[2:0])
-				3'd0: collect_buf[ 7: 0] <= fetch_byte;
-				3'd1: collect_buf[15: 8] <= fetch_byte;
-				3'd2: collect_buf[23:16] <= fetch_byte;
-				3'd3: collect_buf[31:24] <= fetch_byte;
-				3'd4: collect_buf[39:32] <= fetch_byte;
-				3'd5: collect_buf[47:40] <= fetch_byte;
-				3'd6: collect_buf[55:48] <= fetch_byte;
-				3'd7: collect_buf[63:56] <= fetch_byte;
-			endcase
-			collect_cnt <= collect_cnt + 4'd1;
-			addr_idx    <= addr_idx + 13'd1;
+// =============================================================
+S_STORE_VAL: begin
+case (collect_cnt[2:0])
+3'd0: collect_buf[ 7: 0] <= fetch_byte;
+3'd1: collect_buf[15: 8] <= fetch_byte;
+3'd2: collect_buf[23:16] <= fetch_byte;
+3'd3: collect_buf[31:24] <= fetch_byte;
+3'd4: collect_buf[39:32] <= fetch_byte;
+3'd5: collect_buf[47:40] <= fetch_byte;
+3'd6: collect_buf[55:48] <= fetch_byte;
+3'd7: collect_buf[63:56] <= fetch_byte;
+endcase
+collect_cnt <= collect_cnt + 4'd1;
+addr_idx    <= addr_idx + 13'd1;
 
-			if (collect_cnt == 4'd7 || (addr_idx + 13'd1 >= req_count[12:0])) begin
-				state <= S_FLUSH_BUF;
-			end
-			else if (addr_idx[0]) begin
-				state <= S_READ_PAIR;
-			end else begin
-				state <= S_PARSE_ADDR;
-			end
-		end
+if (collect_cnt == 4'd7 || (addr_idx + 13'd1 >= req_count[12:0])) begin
+state <= S_FLUSH_BUF;
+end
+else if (addr_idx[0]) begin
+state <= S_READ_PAIR;
+end else begin
+state <= S_PARSE_ADDR;
+end
+end
 
-		// =============================================================
-		S_FLUSH_BUF: begin
-			ddram_wr_addr <= VALCACHE_BASE + 29'd1 + {16'd0, val_word_idx};
-			ddram_wr_din  <= collect_buf;
-			ddram_wr_be   <= (collect_cnt == 4'd8) ? 8'hFF
-			                 : ((8'd1 << collect_cnt[2:0]) - 8'd1);
-			ddram_wr_req  <= ~ddram_wr_req;
-			val_word_idx  <= val_word_idx + 13'd1;
-			collect_cnt   <= 4'd0;
-			collect_buf   <= 64'd0;
+// =============================================================
+S_FLUSH_BUF: begin
+ddram_wr_addr <= VALCACHE_BASE + 29'd1 + {16'd0, val_word_idx};
+ddram_wr_din  <= collect_buf;
+ddram_wr_be   <= (collect_cnt == 4'd8) ? 8'hFF
+                 : ((8'd1 << collect_cnt[2:0]) - 8'd1);
+ddram_wr_req  <= ~ddram_wr_req;
+val_word_idx  <= val_word_idx + 13'd1;
+collect_cnt   <= 4'd0;
+collect_buf   <= 64'd0;
 
-			if (addr_idx >= req_count[12:0]) begin
-				return_state <= S_WRITE_RESP;
-			end else if (!addr_idx[0]) begin
-				return_state <= S_READ_PAIR;
-			end else begin
-				return_state <= S_PARSE_ADDR;
-			end
-			state <= S_DD_WR_WAIT;
-		end
+if (addr_idx >= req_count[12:0]) begin
+return_state <= S_WRITE_RESP;
+end else if (!addr_idx[0]) begin
+return_state <= S_READ_PAIR;
+end else begin
+return_state <= S_PARSE_ADDR;
+end
+state <= S_DD_WR_WAIT;
+end
 
-		// =============================================================
-		S_WRITE_RESP: begin
-			ddram_wr_addr <= VALCACHE_BASE;
-			ddram_wr_din  <= {frame_counter + 32'd1, req_id};
-			ddram_wr_be   <= 8'hFF;
-			ddram_wr_req  <= ~ddram_wr_req;
-			return_state  <= S_WR_HDR0;
-			state         <= S_DD_WR_WAIT;
-		end
+// =============================================================
+S_WRITE_RESP: begin
+ddram_wr_addr <= VALCACHE_BASE;
+ddram_wr_din  <= {frame_counter + 32'd1, req_id};
+ddram_wr_be   <= 8'hFF;
+ddram_wr_req  <= ~ddram_wr_req;
+return_state  <= S_WR_HDR0;
+state         <= S_DD_WR_WAIT;
+end
 
-		S_WR_HDR0: begin
-			ddram_wr_addr <= DDRAM_BASE;
-			ddram_wr_din  <= {16'd0, 8'h00, 8'd0, 32'h52414348};
-			ddram_wr_be   <= 8'hFF;
-			ddram_wr_req  <= ~ddram_wr_req;
-			return_state  <= S_WR_HDR1;
-			state         <= S_DD_WR_WAIT;
-		end
+S_WR_HDR0: begin
+ddram_wr_addr <= DDRAM_BASE;
+ddram_wr_din  <= {16'd0, 8'h00, 8'd0, 32'h52414348};
+ddram_wr_be   <= 8'hFF;
+ddram_wr_req  <= ~ddram_wr_req;
+return_state  <= S_WR_HDR1;
+state         <= S_DD_WR_WAIT;
+end
 
-		S_WR_HDR1: begin
-			frame_counter <= frame_counter + 32'd1;
-			ddram_wr_addr <= DDRAM_BASE + 29'd1;
-			ddram_wr_din  <= {32'd0, frame_counter + 32'd1};
-			ddram_wr_be   <= 8'hFF;
-			ddram_wr_req  <= ~ddram_wr_req;
-			return_state  <= S_WR_DBG;
-			state         <= S_DD_WR_WAIT;
-		end
+S_WR_HDR1: begin
+frame_counter <= frame_counter + 32'd1;
+ddram_wr_addr <= DDRAM_BASE + 29'd1;
+ddram_wr_din  <= {32'd0, frame_counter + 32'd1};
+ddram_wr_be   <= 8'hFF;
+ddram_wr_req  <= ~ddram_wr_req;
+return_state  <= S_WR_DBG;
+state         <= S_DD_WR_WAIT;
+end
 
-		// Debug word 1: {ver(8), dispatch_cnt(8), first_dout(16), timeout_cnt(16), ok_cnt(16)}
-		S_WR_DBG: begin
-			ddram_wr_addr <= DDRAM_BASE + 29'd2;
-			ddram_wr_din  <= {FPGA_VERSION, dbg_dispatch_cnt, dbg_first_dout,
-			                  dbg_timeout_cnt, dbg_ok_cnt};
-			ddram_wr_be   <= 8'hFF;
-			ddram_wr_req  <= ~ddram_wr_req;
-			return_state  <= S_WR_DBG2;
-			state         <= S_DD_WR_WAIT;
-		end
+S_WR_DBG: begin
+ddram_wr_addr <= DDRAM_BASE + 29'd2;
+ddram_wr_din  <= {FPGA_VERSION, dbg_dispatch_cnt, dbg_first_dout,
+                  dbg_timeout_cnt, dbg_ok_cnt};
+ddram_wr_be   <= 8'hFF;
+ddram_wr_req  <= ~ddram_wr_req;
+return_state  <= S_WR_DBG2;
+state         <= S_DD_WR_WAIT;
+end
 
-		// Debug word 2: {first_addr(16), 0(16), 0(16), max_timeout(16)}
-		S_WR_DBG2: begin
-			ddram_wr_addr <= DDRAM_BASE + 29'd3;
-			ddram_wr_din  <= {dbg_first_addr, 16'd0, 16'd0, dbg_max_timeout};
-			ddram_wr_be   <= 8'hFF;
-			ddram_wr_req  <= ~ddram_wr_req;
-			return_state  <= S_IDLE;
-			state         <= S_DD_WR_WAIT;
-		end
+S_WR_DBG2: begin
+ddram_wr_addr <= DDRAM_BASE + 29'd3;
+ddram_wr_din  <= {dbg_first_addr, 16'd0, 16'd0, dbg_max_timeout};
+ddram_wr_be   <= 8'hFF;
+ddram_wr_req  <= ~ddram_wr_req;
+return_state  <= S_IDLE;
+state         <= S_DD_WR_WAIT;
+end
 
-		endcase
-	end
+// =============================================================
+// Realtime Query States (Option C "on steroids")
+// =============================================================
+S_QRY_PARSE: begin
+if (rd_data[7:0] != qry_last_seen_seq && rd_data[15:8] != 8'd0) begin
+qry_request_seq <= rd_data[7:0];
+qry_num         <= (rd_data[15:8] > {4'd0, MAX_RT_QUERIES}) ?
+                   {4'd0, MAX_RT_QUERIES} : rd_data[15:8];
+qry_idx         <= 4'd0;
+state           <= S_QRY_RD_REQ;
+end else begin
+state <= S_IDLE;
+end
+end
+
+S_QRY_RD_REQ: begin
+ddram_rd_addr <= QUERY_REQ_BASE + {25'd0, qry_idx};
+ddram_rd_req  <= ~ddram_rd_req;
+return_state  <= S_QRY_FETCH;
+state         <= S_DD_RD_WAIT;
+end
+
+S_QRY_FETCH: begin
+qry_addr      <= rd_data[31:0];
+qry_num_bytes <= (rd_data[39:32] == 8'd0) ? 8'd1 : rd_data[39:32];
+qry_value     <= 32'd0;
+qry_byte_idx  <= 3'd0;
+ch4_addr        <= {6'b0, rd_data[20:0]};
+ch4_req         <= 1'b1;
+ch4_req_pending <= 1'b1;
+qry_ch4_phase   <= 1'b0;
+timeout         <= 16'd0;
+state           <= S_QRY_WAIT;
+end
+
+S_QRY_WAIT: begin
+timeout <= timeout + 16'd1;
+if (!qry_ch4_phase) begin
+qry_ch4_phase <= 1'b1;
+end else begin
+if (ch4_ready) begin
+ch4_req_pending <= 1'b0;
+case (qry_addr[0])
+1'b0: qry_value <= qry_value | ({24'd0, ch4_dout[7:0]}  << (qry_byte_idx * 8));
+1'b1: qry_value <= qry_value | ({24'd0, ch4_dout[15:8]} << (qry_byte_idx * 8));
+endcase
+qry_byte_idx <= qry_byte_idx + 3'd1;
+if (qry_byte_idx + 3'd1 >= qry_num_bytes[2:0]) begin
+state <= S_QRY_WR_RESP;
+end else begin
+qry_addr    <= qry_addr + 32'd1;
+ch4_addr    <= {6'b0, qry_addr[20:0] + 21'd1};
+ch4_req     <= 1'b1;
+ch4_req_pending <= 1'b1;
+qry_ch4_phase <= 1'b0;
+timeout     <= 16'd0;
+end
+end
+end
+if (timeout >= 16'hFFFF) begin
+ch4_req_pending <= 1'b0;
+qry_byte_idx <= qry_byte_idx + 3'd1;
+if (qry_byte_idx + 3'd1 >= qry_num_bytes[2:0]) begin
+state <= S_QRY_WR_RESP;
+end else begin
+qry_addr    <= qry_addr + 32'd1;
+ch4_addr    <= {6'b0, qry_addr[20:0] + 21'd1};
+ch4_req     <= 1'b1;
+ch4_req_pending <= 1'b1;
+qry_ch4_phase <= 1'b0;
+timeout     <= 16'd0;
+end
+end
+end
+
+S_QRY_WR_RESP: begin
+ddram_wr_addr <= QUERY_RESP_BASE + {25'd0, qry_idx};
+ddram_wr_din  <= {32'd0, qry_value};
+ddram_wr_be   <= 8'hFF;
+ddram_wr_req  <= ~ddram_wr_req;
+qry_idx       <= qry_idx + 4'd1;
+if (qry_idx + 4'd1 >= qry_num[3:0]) begin
+return_state <= S_QRY_WR_CTRL;
+end else begin
+return_state <= S_QRY_RD_REQ;
+end
+state <= S_DD_WR_WAIT;
+end
+
+S_QRY_WR_CTRL: begin
+qry_last_seen_seq <= qry_request_seq;
+ddram_wr_addr     <= QUERY_CTRL_ADDR;
+ddram_wr_din      <= {24'd0, qry_request_seq, 16'd0, qry_num[7:0], qry_request_seq};
+ddram_wr_be       <= 8'hFF;
+ddram_wr_req      <= ~ddram_wr_req;
+return_state      <= S_IDLE;
+state             <= S_DD_WR_WAIT;
+end
+
+endcase
+end
 end
 
 endmodule

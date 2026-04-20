@@ -345,7 +345,7 @@ wire reset_or = RESET | buttons[1] | status[0] | bios_download | exe_download | 
 // 0         1         2         3          4         5         6          7         8         9
 // 01234567890123456789012345678901 23456789012345678901234567890123 45678901234567890123456789012345
 // 0123456789ABCDEFGHIJKLMNOPQRSTUV 0123456789ABCDEFGHIJKLMNOPQRSTUV
-//  XXXX XXXXXX XXXXXX XXXXX  XX XX XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX XXXXXXXXXXXXXXXXXXXXXXXXXXXXX
+//  XXXX XXXXXX XXXXXX XXXXX  XX XX XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
 
 `include "build_id.v"
 parameter CONF_STR = {
@@ -354,7 +354,7 @@ parameter CONF_STR = {
 	"h7-,Reload core for CD;",
 	"F1,EXE,Load Exe;",
 	"-;",
-	"d6C,Cheats;",
+	"h6C,Cheats;",
 	"h6O[6],Cheats Enabled,Yes,No;",
 	"-;",
 	"hA-,Memcard Status: not saved;",
@@ -481,7 +481,8 @@ parameter CONF_STR = {
 reg dbg_enabled = 0;
 wire  [1:0] buttons;
 wire [127:0] status;
-wire [15:0] status_menumask = {(PadPortNeGcon1 | PadPortNeGcon2), hack_480p, filter_on, saving_memcard, (bk_pending | saving_memcard), bk_pending, status[59], multitap, biosMod, ~TURBO_MEM, (status[55] && ~hack_480p), (PadPortDS1 | PadPortDS2), dbg_enabled, (PadPortGunCon1 | PadPortGunCon2 | PadPortJustif1 | PadPortJustif2), SDRAM2_EN, (snacPort1 | snacPort2)};
+wire hardcore = status[93];
+wire [15:0] status_menumask = {(PadPortNeGcon1 | PadPortNeGcon2), hack_480p, filter_on, saving_memcard, (bk_pending | saving_memcard), bk_pending, status[59], multitap, biosMod, (~TURBO_MEM & ~hardcore), (status[55] && ~hack_480p), (PadPortDS1 | PadPortDS2), dbg_enabled, (PadPortGunCon1 | PadPortGunCon2 | PadPortJustif1 | PadPortJustif2), SDRAM2_EN, (snacPort1 | snacPort2)};
 wire        forced_scandoubler;
 reg  [31:0] sd_lba0 = 0;
 reg  [31:0] sd_lba1;
@@ -818,7 +819,7 @@ savestate_ui savestate_ui
 (
 	.clk            (clk_1x        ),
 	.ps2_key        (ps2_key[10:0] ),
-	.allow_ss       (cart_loaded   ),
+	.allow_ss       (cart_loaded & ~hardcore),
 	.joySS          (joy_unmod[16] ),
 	.joyRight       (joy_unmod[0]  ),
 	.joyLeft        (joy_unmod[1]  ),
