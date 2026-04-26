@@ -155,6 +155,9 @@ reg [31:0] qry_value;
 reg  [2:0] qry_byte_idx;
 reg        qry_ch4_phase;
 
+// Rate limiter for query mailbox polling (prevents continuous DDRAM contention)
+reg [9:0]  qry_poll_timer;
+
 // Debug counters
 reg [15:0] dbg_ok_cnt;
 reg [15:0] dbg_timeout_cnt;
@@ -180,6 +183,7 @@ ch4_req_pending <= 1'b0;
 ddram_wr_req    <= dwr_ack_s2;
 ddram_rd_req    <= drd_ack_s2;
 qry_last_seen_seq <= 8'd0;
+qry_poll_timer  <= 10'd0;
 end
 else begin
 // Deassert ch4_req after one cycle (pulse)
@@ -194,6 +198,7 @@ S_IDLE: begin
 active <= 1'b0;
 if (vblank_pending) begin
 active <= 1'b1;
+qry_poll_timer   <= 10'd0;
 dbg_ok_cnt       <= 16'd0;
 dbg_timeout_cnt  <= 16'd0;
 dbg_first_cap    <= 1'b0;
@@ -209,8 +214,14 @@ ddram_wr_req  <= ~ddram_wr_req;
 return_state  <= S_READ_HDR;
 state         <= S_DD_WR_WAIT;
 end
+else if (qry_poll_timer < 10'd1000) begin
+// Rate limit: wait ~30µs between query polls to avoid
+// continuous DDRAM contention that stalls the PSX core
+qry_poll_timer <= qry_poll_timer + 10'd1;
+end
 else begin
-// Poll realtime query mailbox when not in VBlank
+// Poll realtime query mailbox (~33K polls/sec instead of ~2M)
+qry_poll_timer <= 10'd0;
 ddram_rd_addr <= QUERY_CTRL_ADDR;
 ddram_rd_req  <= ~ddram_rd_req;
 return_state  <= S_QRY_PARSE;
