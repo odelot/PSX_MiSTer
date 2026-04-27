@@ -12,7 +12,7 @@ The upstream PSX core is an FPGA PlayStation implementation. This fork adds two 
 
 | File | Purpose |
 |------|--------|
-| `rtl/ra_ram_mirror_psx.sv` | Reads requested PSX Main RAM addresses and writes cached values to DDRAM for the ARM CPU |
+| `rtl/ra_ram_mirror_psx.sv` | Selective-address mirror with RTQuery mailbox (FPGA v2): serves batched cache updates and realtime single-read queries |
 | `rtl/ddram_arb_psx.sv` | DDRAM arbiter that gives the PSX core priority while allowing the RA module to use idle cycles |
 
 ### Modified Files
@@ -22,14 +22,14 @@ The upstream PSX core is an FPGA PlayStation implementation. This fork adds two 
 | `PSX.sv` | Instantiates both new modules, wires SDRAM CH4 for RA reads, adds DDRAM read/write channels |
 | `files.qip` | Adds both new `.sv` files to the Quartus project |
 
-### How the RAM Mirror Works
+### How the RAM Mirror Works (Simplified Algorithm)
 
-The PSX has 2 MB of main RAM — too large to copy wholesale every frame. Like the SNES implementation, the PSX core uses a **selective address protocol (Option C)**:
+The PSX has 2 MB of main RAM — too large to copy wholesale every frame. The current implementation uses **Smart Option C** in Main_MiSTer plus FPGA RTQuery support:
 
-1. The **ARM binary** writes a list of RAM addresses it needs to evaluate to DDRAM offset `0x40000` (up to 4096 addresses per frame).
-2. On each **VBlank**, the FPGA module reads those addresses one by one from PSX Main RAM via a dedicated SDRAM channel (CH4), accumulating the byte values.
-3. The values are written in 8-byte chunks to DDRAM offset `0x48000`, and a response counter is updated so the ARM knows the data is ready.
-4. The ARM binary reads the values and feeds them to the rcheevos achievement engine for evaluation.
+1. A one-time bootstrap collect seeds the address cache (`0x40000` list / `0x48000` values).
+2. During gameplay, cached addresses are read normally from FPGA responses.
+3. If an address is missing (common in pointer-heavy `AddAddress` / `AddSource` conditions), Main_MiSTer performs an immediate **RTQuery** read via mailbox at `0x50000`.
+4. Newly discovered addresses are appended dynamically and flushed to FPGA cache; no periodic pointer re-collect loop is needed.
 
 The `ddram_arb_psx.sv` arbiter ensures the PSX core always has priority on the DDRAM bus — the RA module only accesses DDRAM during idle cycles, so there is no impact on emulation timing.
 
@@ -45,6 +45,9 @@ The `ddram_arb_psx.sv` arbiter ensures the PSX core always has priority on the D
 0x00000   Header:   magic ("RACH") + flags + frame counter
 0x40000   AddrReq:  ARM → FPGA address request list (count + request_id + addresses)
 0x48000   ValResp:  FPGA → ARM value response cache (response_id + response_frame + values)
+0x50000   RTQuery Ctrl: request_seq/response_seq/num_queries
+0x50008   RTQuery Req:  up to 16 realtime queries (address + size)
+0x50088   RTQuery Resp: realtime values returned by FPGA
 ```
 
 All data flows through shared DDRAM at ARM physical address **0x3D000000**.
