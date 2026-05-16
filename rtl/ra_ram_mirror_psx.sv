@@ -57,11 +57,17 @@ output reg [31:0] dbg_frame_counter
 localparam [28:0] ADDRLIST_BASE = DDRAM_BASE + 29'h8000;  // byte offset 0x40000 / 8
 localparam [28:0] VALCACHE_BASE = DDRAM_BASE + 29'h9000;  // byte offset 0x48000 / 8
 localparam [12:0] MAX_ADDRS     = 13'd4096;
+// BUG-FIX: was [9:0] = 10'd1024, which truncated to 0 silently (1024 needs 11 bits).
+// With BRAM_DEPTH=0 the cache write condition (`addr_idx < {..., BRAM_DEPTH}`) was
+// always false, so addr_bram was never populated and cached_req_id was always
+// forced to 0xFFFFFFFF -- BRAM cache never hit.
+localparam [10:0] BRAM_DEPTH    = 11'd1024;  // Max addresses cached in LUTRAM
 
 // Realtime query mailbox (Option C "on steroids")
 localparam [28:0] QUERY_CTRL_ADDR = DDRAM_BASE + 29'hA000;  // byte offset 0x50000 / 8
 localparam [28:0] QUERY_REQ_BASE  = DDRAM_BASE + 29'hA001;  // byte offset 0x50008 / 8
 localparam [28:0] QUERY_RESP_BASE = DDRAM_BASE + 29'hA011;  // byte offset 0x50088 / 8
+localparam [28:0] ARM_CFG_ADDR    = DDRAM_BASE + 29'd8;        // byte offset 0x40: ARM-written config
 localparam [3:0]  MAX_RT_QUERIES  = 4'd16;
 
 // FPGA version stamp (ARM checks this to verify bitstream)
@@ -122,6 +128,10 @@ localparam S_QRY_FETCH   = 5'd19;
 localparam S_QRY_WAIT    = 5'd20;
 localparam S_QRY_WR_RESP = 5'd21;
 localparam S_QRY_WR_CTRL = 5'd22;
+localparam S_RD_ARMCFG    = 5'd23;  // initiate read of ARM config word
+localparam S_PARSE_ARMCFG = 5'd24;  // latch rtquery_armed from rd_data[0]
+localparam S_BRAM_READ    = 5'd25;  // read address from BRAM cache (1 cycle, async LUTRAM)
+localparam S_WR_DBG3      = 5'd26;  // diagnostic counters (bram/qry) at DDRAM offset 0x20
 
 reg [4:0]  state;
 reg [4:0]  return_state;
@@ -155,8 +165,15 @@ reg [31:0] qry_value;
 reg  [2:0] qry_byte_idx;
 reg        qry_ch4_phase;
 
-// Rate limiter for query mailbox polling (prevents continuous DDRAM contention)
-reg [9:0]  qry_poll_timer;
+// Rate limiter for query mailbox polling (~60us between polls at 33 MHz).
+reg [10:0]  qry_poll_timer;
+reg        rtquery_armed = 1'b0;  // set by ARM via RA_ARM_CFG_RTQUERY bit
+
+// BRAM address list cache (async LUTRAM -- avoids per-VBlank DDRAM reads)
+reg [31:0] addr_bram [0:1023];
+reg [31:0] cached_req_id    = 32'hFFFFFFFF;  // req_id of last-cached address list
+reg [31:0] cached_req_count = 32'd0;
+reg        use_bram         = 1'b0;          // 1 when BRAM cache is valid this frame
 
 // Debug counters
 reg [15:0] dbg_ok_cnt;
@@ -166,6 +183,11 @@ reg        dbg_first_cap;
 reg [15:0] dbg_max_timeout;
 reg  [7:0] dbg_dispatch_cnt;
 reg [15:0] dbg_first_addr;
+// Diagnostic counters (since boot, saturating at 0xFFFF)
+reg [15:0] dbg_qry_polls    = 16'd0;  // S_IDLE polls of QUERY_CTRL_ADDR
+reg [15:0] dbg_qry_serves   = 16'd0;  // polls that found a new request
+reg [15:0] dbg_bram_hits    = 16'd0;  // VBlanks served fully from BRAM cache
+reg [15:0] dbg_bram_misses  = 16'd0;  // VBlanks that did a full DDRAM list reload
 
 // DDRAM wait timeout counter (prevents permanent stall if arbiter doesn't respond)
 reg [19:0] ddram_wait_timeout;
@@ -183,7 +205,10 @@ ch4_req_pending <= 1'b0;
 ddram_wr_req    <= dwr_ack_s2;
 ddram_rd_req    <= drd_ack_s2;
 qry_last_seen_seq <= 8'd0;
-qry_poll_timer  <= 10'd0;
+qry_poll_timer  <= 11'd0;
+cached_req_id    <= 32'hFFFFFFFF;
+cached_req_count <= 32'd0;
+use_bram         <= 1'b0;
 end
 else begin
 // Deassert ch4_req after one cycle (pulse)
@@ -198,7 +223,7 @@ S_IDLE: begin
 active <= 1'b0;
 if (vblank_pending) begin
 active <= 1'b1;
-qry_poll_timer   <= 10'd0;
+qry_poll_timer   <= 11'd0;
 dbg_ok_cnt       <= 16'd0;
 dbg_timeout_cnt  <= 16'd0;
 dbg_first_cap    <= 1'b0;
@@ -208,24 +233,27 @@ dbg_dispatch_cnt <= 8'd0;
 dbg_first_addr   <= 16'd0;
 // Write header with busy=1
 ddram_wr_addr <= DDRAM_BASE;
-ddram_wr_din  <= {16'd0, 8'h01, 8'd0, 32'h52414348};
+ddram_wr_din  <= {16'h0100, 8'h01, 8'd0, 32'h52414348};
 ddram_wr_be   <= 8'hFF;
 ddram_wr_req  <= ~ddram_wr_req;
 return_state  <= S_READ_HDR;
 state         <= S_DD_WR_WAIT;
 end
-else if (qry_poll_timer < 10'd1000) begin
-// Rate limit: wait ~30µs between query polls to avoid
-// continuous DDRAM contention that stalls the PSX core
-qry_poll_timer <= qry_poll_timer + 10'd1;
+else if (qry_poll_timer < 11'd2000) begin
+// Rate limit: wait ~60us between query polls.
+qry_poll_timer <= qry_poll_timer + 11'd1;
 end
-else begin
-// Poll realtime query mailbox (~33K polls/sec instead of ~2M)
-qry_poll_timer <= 10'd0;
+else if (rtquery_armed) begin
+// Poll realtime query mailbox.
+qry_poll_timer <= 11'd0;
 ddram_rd_addr <= QUERY_CTRL_ADDR;
 ddram_rd_req  <= ~ddram_rd_req;
 return_state  <= S_QRY_PARSE;
 state         <= S_DD_RD_WAIT;
+dbg_qry_polls <= dbg_qry_polls + 16'd1;  // free-running counter (ARM uses modular delta)
+end
+else begin
+qry_poll_timer <= 11'd0;  // no rtquery active, skip poll
 end
 end
 
@@ -267,15 +295,37 @@ S_PARSE_HDR: begin
 req_id <= rd_data[63:32];
 if (rd_data[31:0] == 32'd0) begin
 req_count <= 32'd0;
+use_bram  <= 1'b0;
 state     <= S_WRITE_RESP;
-end else begin
-req_count    <= (rd_data[31:0] > {19'd0, MAX_ADDRS}) ?
-                {19'd0, MAX_ADDRS} : rd_data[31:0];
+end else if (rd_data[63:32] == cached_req_id && rd_data[31:0] == cached_req_count) begin
+// Same address list as last frame -- skip DDRAM reads, serve from BRAM
+req_count    <= cached_req_count[12:0];
 addr_idx     <= 13'd0;
 collect_cnt  <= 4'd0;
 collect_buf  <= 64'd0;
 val_word_idx <= 13'd0;
+use_bram     <= 1'b1;
+state        <= S_BRAM_READ;
+dbg_bram_hits <= dbg_bram_hits + 16'd1;
+end else begin
+// Address list changed -- reload from DDRAM and populate BRAM cache
+req_count    <= (rd_data[31:0] > {19'd0, MAX_ADDRS}) ?
+                {19'd0, MAX_ADDRS} : rd_data[31:0];
+// Only update cache if count fits in BRAM depth
+if (rd_data[31:0] <= {21'd0, BRAM_DEPTH}) begin
+    cached_req_id    <= rd_data[63:32];
+    cached_req_count <= rd_data[31:0];
+end else begin
+    cached_req_id    <= 32'hFFFFFFFF;  // Prevent spurious hit next frame
+    cached_req_count <= 32'd0;
+end
+addr_idx     <= 13'd0;
+collect_cnt  <= 4'd0;
+collect_buf  <= 64'd0;
+val_word_idx <= 13'd0;
+use_bram     <= 1'b0;  // This frame uses DDRAM path; next frame uses BRAM
 state        <= S_READ_PAIR;
+dbg_bram_misses <= dbg_bram_misses + 16'd1;
 end
 end
 
@@ -291,8 +341,12 @@ S_PARSE_ADDR: begin
 if (!addr_idx[0]) begin
 addr_word <= rd_data;
 cur_addr  <= rd_data[31:0];
+if (addr_idx < {2'd0, BRAM_DEPTH})
+    addr_bram[addr_idx[9:0]] <= rd_data[31:0];
 end else begin
 cur_addr <= addr_word[63:32];
+if (addr_idx < {2'd0, BRAM_DEPTH})
+    addr_bram[addr_idx[9:0]] <= addr_word[63:32];
 end
 state <= S_DISPATCH;
 end
@@ -370,6 +424,9 @@ addr_idx    <= addr_idx + 13'd1;
 if (collect_cnt == 4'd7 || (addr_idx + 13'd1 >= req_count[12:0])) begin
 state <= S_FLUSH_BUF;
 end
+else if (use_bram) begin
+state <= S_BRAM_READ;
+end
 else if (addr_idx[0]) begin
 state <= S_READ_PAIR;
 end else begin
@@ -390,6 +447,8 @@ collect_buf   <= 64'd0;
 
 if (addr_idx >= req_count[12:0]) begin
 return_state <= S_WRITE_RESP;
+end else if (use_bram) begin
+return_state <= S_BRAM_READ;
 end else if (!addr_idx[0]) begin
 return_state <= S_READ_PAIR;
 end else begin
@@ -410,7 +469,7 @@ end
 
 S_WR_HDR0: begin
 ddram_wr_addr <= DDRAM_BASE;
-ddram_wr_din  <= {16'd0, 8'h00, 8'd0, 32'h52414348};
+ddram_wr_din  <= {16'h0100, 8'h00, 8'd0, 32'h52414348};
 ddram_wr_be   <= 8'hFF;
 ddram_wr_req  <= ~ddram_wr_req;
 return_state  <= S_WR_HDR1;
@@ -439,11 +498,45 @@ end
 
 S_WR_DBG2: begin
 ddram_wr_addr <= DDRAM_BASE + 29'd3;
-ddram_wr_din  <= {dbg_first_addr, 16'd0, 16'd0, dbg_max_timeout};
+// Layout (LSB first byte): dbg_max_timeout, dbg_bram_hits, dbg_bram_misses, dbg_first_addr
+ddram_wr_din  <= {dbg_first_addr, dbg_bram_misses, dbg_bram_hits, dbg_max_timeout};
 ddram_wr_be   <= 8'hFF;
 ddram_wr_req  <= ~ddram_wr_req;
-return_state  <= S_IDLE;
+return_state  <= S_WR_DBG3;
 state         <= S_DD_WR_WAIT;
+end
+
+S_WR_DBG3: begin
+ddram_wr_addr <= DDRAM_BASE + 29'd4;
+// Layout (LSB first): dbg_qry_polls(16), dbg_qry_serves(16), reserved(32)
+ddram_wr_din  <= {32'd0, dbg_qry_serves, dbg_qry_polls};
+ddram_wr_be   <= 8'hFF;
+ddram_wr_req  <= ~ddram_wr_req;
+return_state  <= S_RD_ARMCFG;  // read ARM config before returning to idle
+state         <= S_DD_WR_WAIT;
+end
+
+// Read ARM-written config byte once per VBlank.
+// ARM sets RA_ARM_CFG_RTQUERY (bit 0) when rtquery is active.
+// FPGA latches it to gate inter-VBlank query mailbox polling.
+S_RD_ARMCFG: begin
+ddram_rd_addr <= ARM_CFG_ADDR;
+ddram_rd_req  <= ~ddram_rd_req;
+return_state  <= S_PARSE_ARMCFG;
+state         <= S_DD_RD_WAIT;
+end
+
+S_PARSE_ARMCFG: begin
+rtquery_armed <= rd_data[0];
+state <= S_IDLE;
+end
+
+// =============================================================
+// BRAM address cache read (async LUTRAM -- 1 cycle, no DDRAM stall)
+// =============================================================
+S_BRAM_READ: begin
+cur_addr <= addr_bram[addr_idx[9:0]];
+state    <= S_DISPATCH;
 end
 
 // =============================================================
@@ -456,6 +549,7 @@ qry_num         <= (rd_data[15:8] > {4'd0, MAX_RT_QUERIES}) ?
                    {4'd0, MAX_RT_QUERIES} : rd_data[15:8];
 qry_idx         <= 4'd0;
 state           <= S_QRY_RD_REQ;
+dbg_qry_serves <= dbg_qry_serves + 16'd1;
 end else begin
 state <= S_IDLE;
 end
