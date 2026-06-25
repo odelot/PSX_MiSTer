@@ -165,7 +165,10 @@ reg [31:0] qry_value;
 reg  [2:0] qry_byte_idx;
 reg        qry_ch4_phase;
 
-// Rate limiter for query mailbox polling (~60us between polls at 33 MHz).
+// Rate limiter for query mailbox polling (~45us between polls at 33 MHz).
+// Compromise between 60us (less PSX_BUSY, but 11.6ms burst spike) and 30us
+// (smaller burst spike but 2.4% game slowdown). 45us targets ms/cycle ~16.8
+// and burst dofrm_max ~9-9.5ms.
 reg [10:0]  qry_poll_timer;
 reg        rtquery_armed = 1'b0;  // set by ARM via RA_ARM_CFG_RTQUERY bit
 
@@ -233,14 +236,14 @@ dbg_dispatch_cnt <= 8'd0;
 dbg_first_addr   <= 16'd0;
 // Write header with busy=1
 ddram_wr_addr <= DDRAM_BASE;
-ddram_wr_din  <= {16'h0100, 8'h01, 8'd0, 32'h52414348};
+ddram_wr_din  <= {16'h0200, 8'h01, 8'd0, 32'h52414348};
 ddram_wr_be   <= 8'hFF;
 ddram_wr_req  <= ~ddram_wr_req;
 return_state  <= S_READ_HDR;
 state         <= S_DD_WR_WAIT;
 end
-else if (qry_poll_timer < 11'd2000) begin
-// Rate limit: wait ~60us between query polls.
+else if (qry_poll_timer < 11'd1500) begin
+// Rate limit: wait ~45us between query polls.
 qry_poll_timer <= qry_poll_timer + 11'd1;
 end
 else if (rtquery_armed) begin
@@ -469,7 +472,7 @@ end
 
 S_WR_HDR0: begin
 ddram_wr_addr <= DDRAM_BASE;
-ddram_wr_din  <= {16'h0100, 8'h00, 8'd0, 32'h52414348};
+ddram_wr_din  <= {16'h0200, 8'h00, 8'd0, 32'h52414348};
 ddram_wr_be   <= 8'hFF;
 ddram_wr_req  <= ~ddram_wr_req;
 return_state  <= S_WR_HDR1;

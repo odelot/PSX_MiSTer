@@ -358,7 +358,7 @@ parameter CONF_STR = {
 	"h6O[6],Cheats Enabled,Yes,No;",
 	"-;",
 	"hA-,Memcard Status: not saved;",
-	"HB-,Memcard Status: saved;",
+	"HAHC-,Memcard Status: saved;",
 	"hC-,Memcard Status: saving...;",
 	"RD,Save Memory Cards;",
 	"O[71],Save to SDCard,On Open OSD,Manual;",
@@ -370,7 +370,7 @@ parameter CONF_STR = {
 	"O[68],Autoincrement Slot,Off,On;",
 	"O[38:37],Savestate Slot,1,2,3,4;",
 	"RH,Save state (Alt-F1);",
-	"HGRI,Restore state (F1);",
+	"DBRI,Restore state (F1);",
 	"-;",
 	"O[40:39],System Type,Auto,NTSC-U,NTSC-J,PAL;",
 	"-;",
@@ -482,7 +482,11 @@ reg dbg_enabled = 0;
 wire  [1:0] buttons;
 wire [127:0] status;
 wire hardcore = status[93];
-wire [16:0] status_menumask = {hardcore, (PadPortNeGcon1 | PadPortNeGcon2), hack_480p, filter_on, saving_memcard, (bk_pending | saving_memcard), bk_pending, status[59], multitap, biosMod, (~TURBO_MEM & ~hardcore), (status[55] && ~hack_480p), (PadPortDS1 | PadPortDS2), dbg_enabled, (PadPortGunCon1 | PadPortGunCon2 | PadPortJustif1 | PadPortJustif2), SDRAM2_EN, (snacPort1 | snacPort2)};
+// NOTE: hps_io status_menumask is only 16 bits wide ([15:0]); bit 16 would be
+// truncated and never reach the menu. 'hardcore' therefore occupies the bit-11
+// slot, which previously held the redundant (bk_pending | saving_memcard) signal
+// (== bit10 | bit12). The "Memcard Status: saved" entry now chains HA+HC instead.
+wire [15:0] status_menumask = {(PadPortNeGcon1 | PadPortNeGcon2), hack_480p, filter_on, saving_memcard, hardcore, bk_pending, status[59], multitap, biosMod, (~TURBO_MEM & ~hardcore), (status[55] && ~hack_480p), (PadPortDS1 | PadPortDS2), dbg_enabled, (PadPortGunCon1 | PadPortGunCon2 | PadPortJustif1 | PadPortJustif2), SDRAM2_EN, (snacPort1 | snacPort2)};
 wire        forced_scandoubler;
 reg  [31:0] sd_lba0 = 0;
 reg  [31:0] sd_lba1;
