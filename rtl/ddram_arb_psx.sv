@@ -37,13 +37,23 @@ module ddram_arb_psx (
 	input  [63:0] ra_wr_din,
 	input   [7:0] ra_wr_be,
 	input         ra_wr_req,
-	output reg    ra_wr_ack,
+	output reg    ra_wr_ack = 0,
 
 	// RetroAchievements read channel (toggle req/ack)
 	input  [28:0] ra_rd_addr,
 	input         ra_rd_req,
-	output reg    ra_rd_ack,
-	output reg [63:0] ra_rd_dout
+	output reg    ra_rd_ack = 0,
+	output reg [63:0] ra_rd_dout,
+
+	// Blanking-sync gate: when enabled, RA requests are only dispatched while
+	// the beam is in horizontal or vertical blanking, so RA DDR3 activity lands
+	// outside visible scanout (analog noise mitigation on RGB/CRT outputs).
+	// Requests are only delayed (worst case ~one scanline, far below the
+	// mirror's ~32ms ack timeout), never dropped, and the VBlank snapshot
+	// sweep runs inside VBlank as before — RA semantics are unaffected.
+	input         blank_sync_en,
+	input         hblank,
+	input         vblank
 );
 
 // State machine
@@ -53,6 +63,14 @@ localparam S_RA_RD    = 2'd2;
 localparam S_RA_WAIT  = 2'd3;
 
 reg [1:0] state = S_PASSTHRU;
+
+// hblank/vblank come from the video clock domain; 2FF synchronizers
+reg [1:0] hbl_sync = 2'b00, vbl_sync = 2'b00;
+always @(posedge clk) begin
+	hbl_sync <= {hbl_sync[0], hblank};
+	vbl_sync <= {vbl_sync[0], vblank};
+end
+wire ra_dispatch_ok = ~blank_sync_en | hbl_sync[1] | vbl_sync[1];
 
 // Track pending PSX read bursts: after PSX_RD is accepted, we must
 // not steal the bus until all DOUT_READY words have been delivered.
@@ -92,8 +110,9 @@ always @(posedge clk) begin
 
 	case (state)
 	S_PASSTHRU: begin
-		// Only steal bus when PSX is idle and no burst data pending
-		if (!PSX_WE && !PSX_RD && !PHY_BUSY && !psx_rd_active) begin
+		// Only steal bus when PSX is idle, no burst data pending, and
+		// (if blank-sync enabled) the beam is inside a blanking window
+		if (!PSX_WE && !PSX_RD && !PHY_BUSY && !psx_rd_active && ra_dispatch_ok) begin
 			if (ra_wr_req != ra_wr_ack)
 				state <= S_RA_WR;
 			else if (ra_rd_req != ra_rd_ack)

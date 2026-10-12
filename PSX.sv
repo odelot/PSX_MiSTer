@@ -1555,6 +1555,13 @@ wire        ra_ch4_ready;
 wire        ra_active;
 wire [31:0] ra_dbg_frame;
 
+// RA Blanking Sync: dispatch RA DDR3 traffic only during blanking, so it
+// cannot add analog noise to visible scanout on RGB/CRT setups. Hidden
+// status bit (no OSD entry), written by Main from retroachievements.cfg
+// (psx_blanking_sync). Active-low so it is On whenever nothing writes the
+// bit: status[94]=0 -> On (default), 1 -> Off.
+wire        ra_blank_sync = ~status[94];
+
 // DDRAM arbiter: PSX core + RA → physical DDRAM
 ddram_arb_psx ddram_arb
 (
@@ -1589,7 +1596,11 @@ ddram_arb_psx ddram_arb
 	.ra_rd_addr     (ra_ddram_rd_addr),
 	.ra_rd_req      (ra_ddram_rd_req),
 	.ra_rd_ack      (ra_ddram_rd_ack),
-	.ra_rd_dout     (ra_ddram_rd_dout)
+	.ra_rd_dout     (ra_ddram_rd_dout),
+
+	.blank_sync_en  (ra_blank_sync),
+	.hblank         (hbl),
+	.vblank         (vbl)
 );
 
 // RetroAchievements RAM mirror (reads Main RAM via SDRAM CH4)
